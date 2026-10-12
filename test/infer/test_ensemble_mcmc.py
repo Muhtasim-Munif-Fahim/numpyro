@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 
+import jax
 import jax.numpy as jnp
 import jax.random as random
 
@@ -189,3 +190,48 @@ def test_ensemble_sampler_uses_complementary_halves():
     # Then last two chains get [12, 13] from first iteration using second half [10, 11] as inactive.
     expected = jnp.array([[11.0], [12.0], [12.0], [13.0]])
     assert jnp.allclose(new_state.z, expected)
+
+
+@pytest.mark.parametrize("randomize_split", [False, True])
+def test_aies_reuses_log_density_of_current_chains(randomize_split):
+    # Each step should only evaluate the log density of the proposals: the
+    # one of the current chains is kept in AIESState.log_density.
+    n_chains, num_warmup, num_samples = 20, 10, 10
+    n_calls = []
+
+    def potential_fn(z):
+        jax.debug.callback(lambda: n_calls.append(1))
+        return 0.5 * jnp.sum(z["x"] ** 2)
+
+    kernel = AIES(
+        potential_fn=potential_fn,
+        randomize_split=randomize_split,
+        moves={AIES.DEMove(): 0.5, AIES.StretchMove(): 0.5},
+    )
+    mcmc = MCMC(
+        kernel,
+        num_warmup=num_warmup,
+        num_samples=num_samples,
+        progress_bar=False,
+        num_chains=n_chains,
+        chain_method="vectorized",
+    )
+    init_params = {"x": random.normal(random.key(0), (n_chains, 2))}
+    mcmc.run(random.key(1), init_params=init_params)
+    jax.effects_barrier()
+
+    # one call for the initial positions, then one per half of the ensemble
+    assert len(n_calls) == 1 + 2 * (num_warmup + num_samples)
+
+    state = mcmc.last_state
+    expected = -jax.vmap(potential_fn)(state.z)
+    assert jnp.allclose(state.inner_state.log_density, expected)
+
+
+def test_aies_sample_without_log_density():
+    # A state built without log_density (e.g. by hand) still works.
+    kernel = AIES(potential_fn=lambda z: 0.5 * jnp.sum(z**2))
+    state = kernel.init(random.split(random.key(0), 10), 0, jnp.zeros((10, 2)))
+    state = state._replace(inner_state=state.inner_state._replace(log_density=None))
+    new_state = kernel.sample(state, (), {})
+    assert new_state.inner_state.log_density.shape == (10,)

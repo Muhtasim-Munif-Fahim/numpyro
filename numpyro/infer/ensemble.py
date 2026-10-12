@@ -29,7 +29,11 @@ A :func:`~collections.namedtuple` consisting of the following fields:
  - **rng_key** - random number generator seed used for generating proposals, etc.
 """
 
-AIESState = namedtuple("AIESState", ["i", "accept_prob", "mean_accept_prob", "rng_key"])
+AIESState = namedtuple(
+    "AIESState",
+    ["i", "accept_prob", "mean_accept_prob", "rng_key", "log_density"],
+    defaults=(None,),
+)
 """
 A :func:`~collections.namedtuple` consisting of the following fields.
 
@@ -39,6 +43,9 @@ A :func:`~collections.namedtuple` consisting of the following fields.
  - **mean_accept_prob** - Mean acceptance probability until current iteration
    during warmup adaptation or sampling (for diagnostics).
  - **rng_key** - random number generator seed used for generating proposals, etc.
+ - **log_density** - log density of each chain at its current position, kept so
+   that it does not have to be evaluated again at the next step. If ``None``, it
+   is computed from ``z`` at the next step.
 """
 
 ESSState = namedtuple(
@@ -114,6 +121,22 @@ class EnsembleSampler(MCMCKernel, ABC):
         """return (updated active set of chains, updated inner state)"""
         raise NotImplementedError
 
+    def permute_inner_state(self, inner_state, permutation):
+        """
+        Reorder any per-chain values in ``inner_state`` after the chains were
+        reordered by ``permutation`` (when ``randomize_split=True``).
+        By default, ``inner_state`` is returned unchanged.
+        """
+        return inner_state
+
+    def prepare_inner_state(self, z_flat, inner_state):
+        """
+        Hook called with the flattened chains at the start of :meth:`sample`
+        and returning the inner state to use. By default, ``inner_state`` is
+        returned unchanged.
+        """
+        return inner_state
+
     def _init_state(self, rng_key, model_args, model_kwargs, init_params):
         if self._model is not None:
             (
@@ -178,9 +201,11 @@ class EnsembleSampler(MCMCKernel, ABC):
 
         self._num_warmup = num_warmup
 
-        return EnsembleSamplerState(
-            init_params, self.init_inner_state(rng_key_inner_state), rng_key
+        inner_state = self.prepare_inner_state(
+            batch_ravel_pytree(init_params)[0],
+            self.init_inner_state(rng_key_inner_state),
         )
+        return EnsembleSamplerState(init_params, inner_state, rng_key)
 
     def postprocess_fn(self, args, kwargs):
         if self._postprocess_fn is None:
@@ -191,9 +216,12 @@ class EnsembleSampler(MCMCKernel, ABC):
         z, inner_state, rng_key = state
         rng_key, _ = random.split(rng_key)
         z_flat, unravel_fn = batch_ravel_pytree(z)
+        inner_state = self.prepare_inner_state(z_flat, inner_state)
 
         if self._randomize_split:
-            z_flat = random.permutation(rng_key, z_flat, axis=0)
+            permutation = random.permutation(rng_key, z_flat.shape[0])
+            z_flat = z_flat[permutation]
+            inner_state = self.permute_inner_state(inner_state, permutation)
 
         split_ind = self._num_chains // 2
 
@@ -315,8 +343,18 @@ class AIES(EnsembleSampler):
 
         return AIESState(jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), rng_key)
 
+    def prepare_inner_state(self, z_flat, inner_state):
+        if inner_state.log_density is None:
+            inner_state = inner_state._replace(
+                log_density=self._batch_log_density(z_flat)
+            )
+        return inner_state
+
+    def permute_inner_state(self, inner_state, permutation):
+        return inner_state._replace(log_density=inner_state.log_density[permutation])
+
     def update_active_chains(self, active, inactive, inner_state):
-        i, _, mean_accept_prob, rng_key = inner_state
+        i, _, mean_accept_prob, rng_key, log_density = inner_state
         rng_key, move_key, proposal_key, accept_key = random.split(rng_key, 4)
 
         move_i = random.choice(move_key, len(self._moves), p=self._weights)
@@ -325,16 +363,24 @@ class AIES(EnsembleSampler):
         )
 
         # --- evaluate the proposal ---
-        log_accept_prob = (
-            factors
-            + self._batch_log_density(proposal)
-            - self._batch_log_density(active)
-        )
+        # `log_density` holds the log density of the active chains first and of
+        # the inactive chains second (see the end of this method), so the
+        # active chains do not need to be evaluated again.
+        n_active = active.shape[0]
+        active_log_density = log_density[:n_active]
+        proposal_log_density = self._batch_log_density(proposal)
+        log_accept_prob = factors + proposal_log_density - active_log_density
 
-        accepted = dist.Uniform().sample(accept_key, (active.shape[0],)) < jnp.exp(
+        accepted = dist.Uniform().sample(accept_key, (n_active,)) < jnp.exp(
             log_accept_prob
         )
         updated_active_chains = jnp.where(accepted[:, jnp.newaxis], proposal, active)
+        updated_log_density = jnp.where(
+            accepted, proposal_log_density, active_log_density
+        )
+        # The inactive half is the active one in the next update, so put it
+        # first. After both halves were updated, the order matches `z` again.
+        log_density = jnp.concatenate([log_density[n_active:], updated_log_density])
 
         accept_prob = jnp.count_nonzero(accepted) / accepted.shape[0]
         itr = i + 0.5
@@ -342,7 +388,7 @@ class AIES(EnsembleSampler):
         mean_accept_prob = mean_accept_prob + (accept_prob - mean_accept_prob) / n
 
         return updated_active_chains, AIESState(
-            itr, accept_prob, mean_accept_prob, rng_key
+            itr, accept_prob, mean_accept_prob, rng_key, log_density
         )
 
     @staticmethod
